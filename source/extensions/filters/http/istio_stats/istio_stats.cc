@@ -14,6 +14,8 @@
 
 #include "source/extensions/filters/http/istio_stats/istio_stats.h"
 
+#include <atomic>
+
 #include "envoy/registry/registry.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/singleton/manager.h"
@@ -24,13 +26,15 @@
 #include "source/common/grpc/common.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/header_utility.h"
+#include "source/common/network/utility.h"
 #include "source/common/stream_info/utility.h"
 #include "source/extensions/common/utils.h"
+#include "source/extensions/common/filter_objects.h"
 #include "source/extensions/filters/common/expr/cel_state.h"
 #include "source/extensions/filters/common/expr/context.h"
 #include "source/extensions/filters/common/expr/evaluator.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
-#include "source/extensions/filters/network/istio_authn/config.h"
+#include "source/extensions/filters/http/grpc_stats/grpc_stats_filter.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -79,8 +83,7 @@ enum class Reporter {
   ClientSidecar,
   // Regular inbound listener on a sidecar.
   ServerSidecar,
-  // Inbound listener on a shared proxy. The destination properties are derived
-  // from the endpoint metadata instead of the proxy bootstrap.
+  // Gateway listener for a set of destination workloads.
   ServerGateway,
 };
 
@@ -90,10 +93,8 @@ bool peerInfoRead(Reporter reporter, const StreamInfo::FilterState& filter_state
       reporter == Reporter::ServerSidecar || reporter == Reporter::ServerGateway
           ? "wasm.downstream_peer_id"
           : "wasm.upstream_peer_id";
-  const auto* object =
-      filter_state.getDataReadOnly<Envoy::Extensions::Filters::Common::Expr::CelState>(
-          filter_state_key);
-  return object != nullptr;
+  return filter_state.hasDataWithName(filter_state_key) ||
+         filter_state.hasDataWithName("envoy.wasm.metadata_exchange.peer_unknown");
 }
 
 const Wasm::Common::FlatNode* peerInfo(Reporter reporter,
@@ -116,6 +117,8 @@ struct Context : public Singleton::Instance {
         request_duration_milliseconds_(pool_.add("istio_request_duration_milliseconds")),
         request_bytes_(pool_.add("istio_request_bytes")),
         response_bytes_(pool_.add("istio_response_bytes")),
+        request_messages_total_(pool_.add("istio_request_messages_total")),
+        response_messages_total_(pool_.add("istio_response_messages_total")),
         tcp_connections_opened_total_(pool_.add("istio_tcp_connections_opened_total")),
         tcp_connections_closed_total_(pool_.add("istio_tcp_connections_closed_total")),
         tcp_sent_bytes_total_(pool_.add("istio_tcp_sent_bytes_total")),
@@ -164,6 +167,8 @@ struct Context : public Singleton::Instance {
         {"request_duration_milliseconds", request_duration_milliseconds_},
         {"request_bytes", request_bytes_},
         {"response_bytes", response_bytes_},
+        {"request_messages_total", request_messages_total_},
+        {"response_messages_total", response_messages_total_},
         {"tcp_connections_opened_total", tcp_connections_opened_total_},
         {"tcp_connections_closed_total", tcp_connections_closed_total_},
         {"tcp_sent_bytes_total", tcp_sent_bytes_total_},
@@ -209,6 +214,8 @@ struct Context : public Singleton::Instance {
   const Stats::StatName request_duration_milliseconds_;
   const Stats::StatName request_bytes_;
   const Stats::StatName response_bytes_;
+  const Stats::StatName request_messages_total_;
+  const Stats::StatName response_messages_total_;
   const Stats::StatName tcp_connections_opened_total_;
   const Stats::StatName tcp_connections_closed_total_;
   const Stats::StatName tcp_sent_bytes_total_;
@@ -285,8 +292,7 @@ using google::api::expr::runtime::CelValue;
 // Instructions on dropping, creating, and overriding labels.
 // This is not the "hot path" of the metrics system and thus, fairly
 // unoptimized.
-struct MetricOverrides : public Logger::Loggable<Logger::Id::filter>,
-                         public Filters::Common::Expr::StreamActivation {
+struct MetricOverrides : public Logger::Loggable<Logger::Id::filter> {
   MetricOverrides(ContextSharedPtr& context, Stats::SymbolTable& symbol_table)
       : context_(context), pool_(symbol_table) {}
   ContextSharedPtr context_;
@@ -313,57 +319,6 @@ struct MetricOverrides : public Logger::Loggable<Logger::Id::filter>,
   // Third transformation: tags added.
   using TagAdditions = std::vector<std::pair<Stats::StatName, uint32_t>>;
   absl::flat_hash_map<Stats::StatName, TagAdditions> tag_additions_;
-
-  void evaluate(Stats::StatNameDynamicPool& pool, const StreamInfo::StreamInfo& info,
-                const Http::RequestHeaderMap* request_headers,
-                const Http::ResponseHeaderMap* response_headers,
-                const Http::ResponseTrailerMap* response_trailers,
-                std::vector<std::pair<Stats::StatName, uint64_t>>& expr_values) {
-    activation_info_ = &info;
-    activation_request_headers_ = request_headers;
-    activation_response_headers_ = response_headers;
-    activation_response_trailers_ = response_trailers;
-    expr_values.reserve(compiled_exprs_.size());
-    for (size_t id = 0; id < compiled_exprs_.size(); id++) {
-      Protobuf::Arena arena;
-      auto eval_status = compiled_exprs_[id].first->Evaluate(*this, &arena);
-      if (!eval_status.ok() || eval_status.value().IsError()) {
-        expr_values.push_back(std::make_pair(context_->unknown_, 0));
-      } else {
-        const auto string_value = Filters::Common::Expr::print(eval_status.value());
-        if (compiled_exprs_[id].second) {
-          uint64_t amount = 0;
-          if (!absl::SimpleAtoi(string_value, &amount)) {
-            ENVOY_LOG(trace, "Failed to get metric value: {}", string_value);
-          }
-          expr_values.push_back(std::make_pair(Stats::StatName(), amount));
-        } else {
-          expr_values.push_back(std::make_pair(pool.add(string_value), 0));
-        }
-      }
-    }
-    resetActivation();
-  }
-
-  absl::optional<CelValue> FindValue(absl::string_view name,
-                                     Protobuf::Arena* arena) const override {
-    auto obj = StreamActivation::FindValue(name, arena);
-    if (obj) {
-      return obj;
-    }
-    if (name == "node") {
-      return Filters::Common::Expr::CelProtoWrapper::CreateMessage(&context_->node_, arena);
-    }
-    if (activation_info_) {
-      const auto* obj = activation_info_->filterState()
-                            .getDataReadOnly<Envoy::Extensions::Filters::Common::Expr::CelState>(
-                                absl::StrCat("wasm.", name));
-      if (obj) {
-        return obj->exprValue(arena, false);
-      }
-    }
-    return {};
-  }
 
   Stats::StatNameTagVector
   overrideTags(Stats::StatName metric, const Stats::StatNameTagVector& tags,
@@ -427,6 +382,73 @@ struct MetricOverrides : public Logger::Loggable<Logger::Id::filter>,
   absl::flat_hash_map<std::string, uint32_t> expression_ids_;
 };
 
+// Self-managed scope with active rotation. Envoy stats scope controls the
+// lifetime of the individual metrics. Because the scope is attached to xDS
+// resources, metrics with data derived from the requests can accumulate and
+// grow indefinitely for long-living xDS resources. To limit this growth,
+// this class implements a rotation mechanism, whereas a new scope is created
+// periodically to replace the current scope.
+//
+// The replaced stats scope is deleted gracefully after a minimum of 1s delay
+// for two reasons:
+//
+// 1. Stats flushing is asynchronous and the data may be lost if not flushed
+// before the deletion (see stats_flush_interval).
+//
+// 2. The implementation avoids locking by releasing a raw pointer to workers.
+// When the rotation happens on the main, the raw pointer may still be in-use
+// by workers for a short duration.
+class RotatingScope : public Logger::Loggable<Logger::Id::filter> {
+public:
+  RotatingScope(Server::Configuration::FactoryContext& factory_context, uint64_t rotate_interval_ms,
+                uint64_t delete_interval_ms)
+      : parent_scope_(factory_context.scope()), active_scope_(parent_scope_.createScope("")),
+        raw_scope_(active_scope_.get()), rotate_interval_ms_(rotate_interval_ms),
+        delete_interval_ms_(delete_interval_ms) {
+    if (rotate_interval_ms_ > 0) {
+      ASSERT(delete_interval_ms_ < rotate_interval_ms_);
+      ASSERT(delete_interval_ms_ >= 1000);
+      Event::Dispatcher& dispatcher = factory_context.mainThreadDispatcher();
+      rotate_timer_ = dispatcher.createTimer([this] { onRotate(); });
+      delete_timer_ = dispatcher.createTimer([this] { onDelete(); });
+      rotate_timer_->enableTimer(std::chrono::milliseconds(rotate_interval_ms_));
+    }
+  }
+  ~RotatingScope() {
+    if (rotate_timer_) {
+      rotate_timer_->disableTimer();
+      rotate_timer_.reset();
+    }
+    if (delete_timer_) {
+      delete_timer_->disableTimer();
+      delete_timer_.reset();
+    }
+  }
+  Stats::Scope* scope() { return raw_scope_.load(); }
+
+private:
+  void onRotate() {
+    ENVOY_LOG(info, "Rotating active Istio stats scope after {}ms.", rotate_interval_ms_);
+    draining_scope_ = active_scope_;
+    delete_timer_->enableTimer(std::chrono::milliseconds(delete_interval_ms_));
+    active_scope_ = parent_scope_.createScope("");
+    raw_scope_.store(active_scope_.get());
+    rotate_timer_->enableTimer(std::chrono::milliseconds(rotate_interval_ms_));
+  }
+  void onDelete() {
+    ENVOY_LOG(info, "Deleting draining Istio stats scope after {}ms.", delete_interval_ms_);
+    draining_scope_.reset();
+  }
+  Stats::Scope& parent_scope_;
+  Stats::ScopeSharedPtr active_scope_;
+  std::atomic<Stats::Scope*> raw_scope_;
+  Stats::ScopeSharedPtr draining_scope_{nullptr};
+  const uint64_t rotate_interval_ms_;
+  const uint64_t delete_interval_ms_;
+  Event::TimerPtr rotate_timer_{nullptr};
+  Event::TimerPtr delete_timer_{nullptr};
+};
+
 struct Config : public Logger::Loggable<Logger::Id::filter> {
   Config(const stats::PluginConfig& proto_config,
          Server::Configuration::FactoryContext& factory_context)
@@ -436,7 +458,9 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
               return std::make_shared<Context>(factory_context.serverScope().symbolTable(),
                                                factory_context.localInfo().node());
             })),
-        scope_(factory_context.scope()),
+        scope_(factory_context, PROTOBUF_GET_MS_OR_DEFAULT(proto_config, rotation_interval, 0),
+               PROTOBUF_GET_MS_OR_DEFAULT(proto_config, graceful_deletion_interval,
+                                          /* 5m */ 1000 * 60 * 5)),
         disable_host_header_fallback_(proto_config.disable_host_header_fallback()),
         report_duration_(
             PROTOBUF_GET_MS_OR_DEFAULT(proto_config, tcp_reporting_duration, /* 5s */ 5000)) {
@@ -461,7 +485,7 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
       break;
     }
     if (proto_config.metrics_size() > 0 || proto_config.definitions_size() > 0) {
-      metric_overrides_ = std::make_unique<MetricOverrides>(context_, scope_.symbolTable());
+      metric_overrides_ = std::make_unique<MetricOverrides>(context_, scope()->symbolTable());
       for (const auto& definition : proto_config.definitions()) {
         const auto& it = context_->all_metrics_.find(definition.name());
         if (it != context_->all_metrics_.end()) {
@@ -577,7 +601,7 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
   }
 
   // RAII for stream context propagation.
-  struct StreamOverrides {
+  struct StreamOverrides : public Filters::Common::Expr::StreamActivation {
     StreamOverrides(Config& parent, Stats::StatNameDynamicPool& pool,
                     const StreamInfo::StreamInfo& info,
                     const Http::RequestHeaderMap* request_headers = nullptr,
@@ -585,9 +609,53 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
                     const Http::ResponseTrailerMap* response_trailers = nullptr)
         : parent_(parent) {
       if (parent_.metric_overrides_) {
-        parent_.metric_overrides_->evaluate(pool, info, request_headers, response_headers,
-                                            response_trailers, expr_values_);
+        activation_info_ = &info;
+        activation_request_headers_ = request_headers;
+        activation_response_headers_ = response_headers;
+        activation_response_trailers_ = response_trailers;
+        const auto& compiled_exprs = parent_.metric_overrides_->compiled_exprs_;
+        expr_values_.reserve(compiled_exprs.size());
+        for (size_t id = 0; id < compiled_exprs.size(); id++) {
+          Protobuf::Arena arena;
+          auto eval_status = compiled_exprs[id].first->Evaluate(*this, &arena);
+          if (!eval_status.ok() || eval_status.value().IsError()) {
+            expr_values_.push_back(std::make_pair(parent_.context_->unknown_, 0));
+          } else {
+            const auto string_value = Filters::Common::Expr::print(eval_status.value());
+            if (compiled_exprs[id].second) {
+              uint64_t amount = 0;
+              if (!absl::SimpleAtoi(string_value, &amount)) {
+                ENVOY_LOG(trace, "Failed to get metric value: {}", string_value);
+              }
+              expr_values_.push_back(std::make_pair(Stats::StatName(), amount));
+            } else {
+              expr_values_.push_back(std::make_pair(pool.add(string_value), 0));
+            }
+          }
+        }
+        resetActivation();
       }
+    }
+
+    absl::optional<CelValue> FindValue(absl::string_view name,
+                                       Protobuf::Arena* arena) const override {
+      auto obj = StreamActivation::FindValue(name, arena);
+      if (obj) {
+        return obj;
+      }
+      if (name == "node") {
+        return Filters::Common::Expr::CelProtoWrapper::CreateMessage(&parent_.context_->node_,
+                                                                     arena);
+      }
+      if (activation_info_) {
+        const auto* obj = activation_info_->filterState()
+                              .getDataReadOnly<Envoy::Extensions::Filters::Common::Expr::CelState>(
+                                  absl::StrCat("wasm.", name));
+        if (obj) {
+          return obj->exprValue(arena, false);
+        }
+      }
+      return {};
     }
 
     void addCounter(Stats::StatName metric, const Stats::StatNameTagVector& tags,
@@ -597,12 +665,12 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
           return;
         }
         auto new_tags = parent_.metric_overrides_->overrideTags(metric, tags, expr_values_);
-        Stats::Utility::counterFromStatNames(parent_.scope_,
+        Stats::Utility::counterFromStatNames(*parent_.scope(),
                                              {parent_.context_->stat_namespace_, metric}, new_tags)
             .add(amount);
         return;
       }
-      Stats::Utility::counterFromStatNames(parent_.scope_,
+      Stats::Utility::counterFromStatNames(*parent_.scope(),
                                            {parent_.context_->stat_namespace_, metric}, tags)
           .add(amount);
     }
@@ -615,12 +683,12 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
         }
         auto new_tags = parent_.metric_overrides_->overrideTags(metric, tags, expr_values_);
         Stats::Utility::histogramFromStatNames(
-            parent_.scope_, {parent_.context_->stat_namespace_, metric}, unit, new_tags)
+            *parent_.scope(), {parent_.context_->stat_namespace_, metric}, unit, new_tags)
             .recordValue(value);
         return;
       }
       Stats::Utility::histogramFromStatNames(
-          parent_.scope_, {parent_.context_->stat_namespace_, metric}, unit, tags)
+          *parent_.scope(), {parent_.context_->stat_namespace_, metric}, unit, tags)
           .recordValue(value);
     }
 
@@ -632,17 +700,17 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
           switch (metric.type_) {
           case MetricOverrides::MetricType::Counter:
             Stats::Utility::counterFromStatNames(
-                parent_.scope_, {parent_.context_->stat_namespace_, metric.name_}, tags)
+                *parent_.scope(), {parent_.context_->stat_namespace_, metric.name_}, tags)
                 .add(amount);
             break;
           case MetricOverrides::MetricType::Histogram:
             Stats::Utility::histogramFromStatNames(
-                parent_.scope_, {parent_.context_->stat_namespace_, metric.name_},
+                *parent_.scope(), {parent_.context_->stat_namespace_, metric.name_},
                 Stats::Histogram::Unit::Bytes, tags)
                 .recordValue(amount);
             break;
           case MetricOverrides::MetricType::Gauge:
-            Stats::Utility::gaugeFromStatNames(parent_.scope_,
+            Stats::Utility::gaugeFromStatNames(*parent_.scope(),
                                                {parent_.context_->stat_namespace_, metric.name_},
                                                Stats::Gauge::ImportMode::Accumulate, tags)
                 .set(amount);
@@ -664,15 +732,17 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
     tags.push_back({context_->tag_, context_->istio_version_.empty() ? context_->unknown_
                                                                      : context_->istio_version_});
 
-    Stats::Utility::gaugeFromStatNames(scope_, {context_->stat_namespace_, context_->istio_build_},
+    Stats::Utility::gaugeFromStatNames(*scope(),
+                                       {context_->stat_namespace_, context_->istio_build_},
                                        Stats::Gauge::ImportMode::Accumulate, tags)
         .set(1);
   }
 
   Reporter reporter() const { return reporter_; }
+  Stats::Scope* scope() { return scope_.scope(); }
 
   ContextSharedPtr context_;
-  Stats::Scope& scope_;
+  RotatingScope scope_;
   Reporter reporter_;
 
   const bool disable_host_header_fallback_;
@@ -688,7 +758,7 @@ class IstioStatsFilter : public Http::PassThroughFilter,
                          public Network::ConnectionCallbacks {
 public:
   IstioStatsFilter(ConfigSharedPtr config)
-      : config_(config), context_(*config->context_), pool_(config->scope_.symbolTable()) {
+      : config_(config), context_(*config->context_), pool_(config->scope()->symbolTable()) {
     tags_.reserve(25);
     switch (config_->reporter()) {
     case Reporter::ServerSidecar:
@@ -702,14 +772,23 @@ public:
   }
   ~IstioStatsFilter() { ASSERT(report_timer_ == nullptr); }
 
+  // Http::StreamDecoderFilter
+  Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& request_headers, bool) override {
+    is_grpc_ = Grpc::Common::isGrpcRequestHeaders(request_headers);
+    if (is_grpc_) {
+      report_timer_ = decoder_callbacks_->dispatcher().createTimer([this] { onReportTimer(); });
+      report_timer_->enableTimer(config_->report_duration_);
+    }
+    return Http::FilterHeadersStatus::Continue;
+  }
+
   // AccessLog::Instance
   void log(const Http::RequestHeaderMap* request_headers,
            const Http::ResponseHeaderMap* response_headers,
-           const Http::ResponseTrailerMap* response_trailers,
-           const StreamInfo::StreamInfo& info) override {
-    populatePeerInfo(info, info.filterState());
-    const bool is_grpc = request_headers && Grpc::Common::isGrpcRequestHeaders(*request_headers);
-    if (is_grpc) {
+           const Http::ResponseTrailerMap* response_trailers, const StreamInfo::StreamInfo& info,
+           AccessLog::AccessLogType) override {
+    reportHelper(true);
+    if (is_grpc_) {
       tags_.push_back({context_.request_protocol_, context_.grpc_});
     } else {
       tags_.push_back({context_.request_protocol_, context_.http_});
@@ -718,7 +797,7 @@ public:
     // TODO: copy Http::CodeStatsImpl version for status codes and flags.
     tags_.push_back(
         {context_.response_code_, pool_.add(absl::StrCat(info.responseCode().value_or(0)))});
-    if (is_grpc) {
+    if (is_grpc_) {
       auto const& optional_status = Grpc::Common::getGrpcStatus(
           response_trailers ? *response_trailers
                             : *Http::StaticEmptyHeaders::get().response_trailers,
@@ -773,10 +852,6 @@ public:
     case Network::ConnectionEvent::LocalClose:
     case Network::ConnectionEvent::RemoteClose:
       reportHelper(true);
-      if (report_timer_) {
-        report_timer_->disableTimer();
-        report_timer_.reset();
-      }
       break;
     default:
       break;
@@ -786,8 +861,38 @@ public:
   void onBelowWriteBufferLowWatermark() override {}
 
 private:
-  // Invoked periodically for TCP streams.
+  // Invoked periodically for streams.
   void reportHelper(bool end_stream) {
+    if (end_stream && report_timer_) {
+      report_timer_->disableTimer();
+      report_timer_.reset();
+    }
+    // HTTP handled first.
+    if (decoder_callbacks_) {
+      if (!peer_read_) {
+        const auto& info = decoder_callbacks_->streamInfo();
+        peer_read_ = peerInfoRead(config_->reporter(), info.filterState());
+        if (peer_read_ || end_stream) {
+          populatePeerInfo(info, info.filterState());
+        }
+      }
+      if (is_grpc_ && (peer_read_ || end_stream)) {
+        const auto* counters =
+            decoder_callbacks_->streamInfo()
+                .filterState()
+                ->getDataReadOnly<GrpcStats::GrpcStatsObject>("envoy.filters.http.grpc_stats");
+        if (counters) {
+          Config::StreamOverrides stream(*config_, pool_, decoder_callbacks_->streamInfo());
+          stream.addCounter(context_.request_messages_total_, tags_,
+                            counters->request_message_count - request_message_count_);
+          stream.addCounter(context_.response_messages_total_, tags_,
+                            counters->response_message_count - response_message_count_);
+          request_message_count_ = counters->request_message_count;
+          response_message_count_ = counters->response_message_count;
+        }
+      }
+      return;
+    }
     const auto& info = network_read_callbacks_->connection().streamInfo();
     // TCP MX writes to upstream stream info instead.
     OptRef<const StreamInfo::UpstreamInfo> upstream_info;
@@ -800,17 +905,17 @@ private:
             : info.filterState();
 
     Config::StreamOverrides stream(*config_, pool_, info);
-    if (!network_peer_read_) {
-      network_peer_read_ = peerInfoRead(config_->reporter(), filter_state);
+    if (!peer_read_) {
+      peer_read_ = peerInfoRead(config_->reporter(), filter_state);
       // Report connection open once peer info is read or connection is closed.
-      if (network_peer_read_ || end_stream) {
+      if (peer_read_ || end_stream) {
         populatePeerInfo(info, filter_state);
         tags_.push_back({context_.request_protocol_, context_.tcp_});
         populateFlagsAndConnectionSecurity(info);
         stream.addCounter(context_.tcp_connections_opened_total_, tags_);
       }
     }
-    if (network_peer_read_ || end_stream) {
+    if (peer_read_ || end_stream) {
       auto meter = info.getDownstreamBytesMeter();
       if (meter) {
         stream.addCounter(context_.tcp_sent_bytes_total_, tags_,
@@ -889,6 +994,11 @@ private:
                 const auto& host_it = service.find("host");
                 if (host_it != service.end()) {
                   service_host = host_it->second.string_value();
+                }
+                const auto& name_it = service.find("name");
+                if (name_it != service.end()) {
+                  service_host_name = name_it->second.string_value();
+                } else {
                   service_host_name = service_host.substr(0, service_host.find_first_of('.'));
                 }
               }
@@ -903,9 +1013,12 @@ private:
     switch (config_->reporter()) {
     case Reporter::ServerSidecar:
     case Reporter::ServerGateway: {
-      auto principals = NetworkFilters::IstioAuthn::getPrincipals(info.filterState());
-      peer_san = principals.peer;
-      local_san = principals.local;
+      auto peer_principal = info.filterState().getDataReadOnly<Router::StringAccessor>(
+          Extensions::Common::PeerPrincipalKey);
+      auto local_principal = info.filterState().getDataReadOnly<Router::StringAccessor>(
+          Extensions::Common::LocalPrincipalKey);
+      peer_san = peer_principal ? peer_principal->asString() : "";
+      local_san = local_principal ? local_principal->asString() : "";
 
       // This fallback should be deleted once istio_authn is globally enabled.
       if (peer_san.empty() && local_san.empty()) {
@@ -975,7 +1088,11 @@ private:
                                                      : context_.unknown_});
       switch (config_->reporter()) {
       case Reporter::ServerGateway: {
-        auto endpoint_peer = extractEndpointMetadata(info);
+        std::optional<Istio::Common::WorkloadMetadataObject> endpoint_peer;
+        const auto* endpoint_object = peerInfo(Reporter::ClientSidecar, filter_state);
+        if (endpoint_object) {
+          endpoint_peer.emplace(Istio::Common::convertFlatNodeToWorkloadMetadata(*endpoint_object));
+        }
         tags_.push_back(
             {context_.destination_workload_,
              endpoint_peer ? pool_.add(endpoint_peer->workload_name_) : context_.unknown_});
@@ -1073,10 +1190,13 @@ private:
   Stats::StatNameTagVector tags_;
   Event::TimerPtr report_timer_{nullptr};
   Network::ReadFilterCallbacks* network_read_callbacks_;
-  bool network_peer_read_{false};
+  bool peer_read_{false};
   uint64_t bytes_sent_{0};
   uint64_t bytes_received_{0};
   absl::optional<bool> mutual_tls_;
+  bool is_grpc_{false};
+  uint64_t request_message_count_{0};
+  uint64_t response_message_count_{0};
 };
 
 } // namespace

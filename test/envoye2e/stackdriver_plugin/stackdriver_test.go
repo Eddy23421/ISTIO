@@ -26,9 +26,9 @@ import (
 
 func enableStackDriver(t *testing.T, vars map[string]string) {
 	t.Helper()
-	vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_inbound.yaml.tmpl") + "\n" +
+	vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_inbound.yaml.tmpl") + "\n" +
 		driver.LoadTestData("testdata/filters/stackdriver_inbound.yaml.tmpl")
-	vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_outbound.yaml.tmpl") + "\n" +
+	vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_outbound.yaml.tmpl") + "\n" +
 		driver.LoadTestData("testdata/filters/stackdriver_outbound.yaml.tmpl")
 }
 
@@ -499,9 +499,9 @@ func TestStackdriverAccessLog(t *testing.T) {
 			params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/access_log_policy.yaml.tmpl") + "\n" +
 				driver.LoadTestData("testdata/filters/stackdriver_outbound.yaml.tmpl")
 			if tt.enableMetadataExchange {
-				params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_inbound.yaml.tmpl") + "\n" +
+				params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_inbound.yaml.tmpl") + "\n" +
 					params.Vars["ServerHTTPFilters"]
-				params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_outbound.yaml.tmpl") + "\n" +
+				params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_outbound.yaml.tmpl") + "\n" +
 					params.Vars["ClientHTTPFilters"]
 			}
 
@@ -671,9 +671,9 @@ func TestStackdriverAuditLog(t *testing.T) {
 	params.Vars["STSPort"] = strconv.Itoa(int(stsPort))
 	params.Vars["ClientMetadata"] = params.LoadTestData("testdata/client_node_metadata.json.tmpl")
 	params.Vars["ServerMetadata"] = params.LoadTestData("testdata/server_node_metadata.json.tmpl")
-	params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_outbound.yaml.tmpl")
+	params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_outbound.yaml.tmpl")
 	params.Vars["ServerHTTPFilters"] = params.LoadTestData("testdata/filters/rbac_log.yaml.tmpl") + "\n" +
-		driver.LoadTestData("testdata/filters/stackdriver_inbound.yaml.tmpl") + "\n" + driver.LoadTestData("testdata/filters/mx_inbound.yaml.tmpl")
+		driver.LoadTestData("testdata/filters/stackdriver_inbound.yaml.tmpl") + "\n" + driver.LoadTestData("testdata/filters/mx_native_inbound.yaml.tmpl")
 	sd := &Stackdriver{Port: sdPort}
 	intRespCode, _ := strconv.Atoi(respCode)
 	if err := (&driver.Scenario{
@@ -719,14 +719,15 @@ func TestStackdriverAuditLog(t *testing.T) {
 
 func TestStackdriverAttributeGen(t *testing.T) {
 	t.Parallel()
+	env.EnsureWasmFiles(t)
+	env.SkipTSan(t)
 	params := driver.NewTestParams(t, map[string]string{
 		"ServiceAuthenticationPolicy": "NONE",
 		"SDLogStatusCode":             "200",
 		"StackdriverRootCAFile":       driver.TestPath("testdata/certs/stackdriver.pem"),
 		"StackdriverTokenFile":        driver.TestPath("testdata/certs/access-token"),
 		"StatsConfig":                 driver.LoadTestData("testdata/bootstrap/stats.yaml.tmpl"),
-		"AttributeGenWasmRuntime":     "envoy.wasm.runtime.null",
-		"AttributeGenFilterConfig":    "inline_string: \"envoy.wasm.attributegen\"",
+		"AttributeGenFilterConfig":    "filename: " + env.GetBazelWorkspaceOrDie() + "/extensions/attributegen.wasm",
 		"RequestOperation":            "GetMethod",
 	}, envoye2e.ProxyE2ETests)
 	sdPort := params.Ports.Max + 1
@@ -899,9 +900,9 @@ func TestStackdriverAccessLogFilter(t *testing.T) {
 	params.Vars["STSPort"] = strconv.Itoa(int(stsPort))
 	params.Vars["ClientMetadata"] = driver.LoadTestData("testdata/client_node_metadata.json.tmpl")
 	params.Vars["ServerMetadata"] = driver.LoadTestData("testdata/server_node_metadata.json.tmpl")
-	params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_inbound.yaml.tmpl") + "\n" +
+	params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_inbound.yaml.tmpl") + "\n" +
 		driver.LoadTestData("testdata/filters/stackdriver_inbound_logs_filter.yaml.tmpl")
-	params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_outbound.yaml.tmpl") + "\n" +
+	params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_outbound.yaml.tmpl") + "\n" +
 		driver.LoadTestData("testdata/filters/stackdriver_outbound_logs_filter.yaml.tmpl")
 
 	sd := &Stackdriver{Port: sdPort}
@@ -997,8 +998,8 @@ func TestStackdriverRbacAccessDenied(t *testing.T) {
 			params.Vars["STSPort"] = strconv.Itoa(int(stsPort))
 			params.Vars["ClientMetadata"] = params.LoadTestData("testdata/client_node_metadata.json.tmpl")
 			params.Vars["ServerMetadata"] = params.LoadTestData("testdata/server_node_metadata.json.tmpl")
-			params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_outbound.yaml.tmpl")
-			params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_inbound.yaml.tmpl") + "\n" +
+			params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_outbound.yaml.tmpl")
+			params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_inbound.yaml.tmpl") + "\n" +
 				driver.LoadTestData(tc.rbacDryRunFilter) + "\n" +
 				driver.LoadTestData("testdata/filters/rbac.yaml.tmpl") + "\n" +
 				driver.LoadTestData("testdata/filters/stackdriver_inbound.yaml.tmpl")
@@ -1161,8 +1162,8 @@ func TestStackdriverMetricExpiry(t *testing.T) {
 	params.Vars["STSPort"] = strconv.Itoa(int(stsPort))
 	params.Vars["ClientMetadata"] = params.LoadTestData("testdata/client_node_metadata.json.tmpl")
 	params.Vars["ServerMetadata"] = params.LoadTestData("testdata/server_node_metadata.json.tmpl")
-	params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_outbound.yaml.tmpl")
-	params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_inbound.yaml.tmpl") +
+	params.Vars["ClientHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_outbound.yaml.tmpl")
+	params.Vars["ServerHTTPFilters"] = driver.LoadTestData("testdata/filters/mx_native_inbound.yaml.tmpl") +
 		driver.LoadTestData("testdata/filters/stackdriver_inbound.yaml.tmpl")
 	sd := &Stackdriver{Port: sdPort}
 	if err := (&driver.Scenario{
@@ -1197,6 +1198,7 @@ func TestStackdriverMetricExpiry(t *testing.T) {
 			&driver.Repeat{
 				N: 10,
 				Step: &driver.HTTPCall{
+					IP:   "127.0.0.2",
 					Port: params.Ports.ServerPort,
 					Body: "hello, world!",
 				},

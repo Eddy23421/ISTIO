@@ -42,6 +42,7 @@ envoy_cc_library(
     ],
     repository = "@envoy",
     deps = [
+        "//extensions/common:json_util",
         "//external:authentication_policy_config_cc_proto",
         "//source/extensions/common:filter_names_lib",
         "//source/extensions/common:utils_lib",
@@ -103,6 +104,7 @@ envoy_cc_test(
         "//source/extensions/common:filter_names_lib",
         "@envoy//test/mocks/network:network_mocks",
         "@envoy//test/mocks/ssl:ssl_mocks",
+        "@envoy//test/test_common:status_utility_lib",
         "@envoy//test/test_common:utility_lib",
     ],
 )
@@ -158,6 +160,7 @@ envoy_cc_test(
 
 envoy_cc_test(
     name = "http_filter_integration_test",
+    size = "large",
     srcs = ["http_filter_integration_test.cc"],
     data = glob(["testdata/*"]),
     repository = "@envoy",

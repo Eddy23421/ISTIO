@@ -12,7 +12,7 @@ internal_listener: {}
 {{- else }}
 address:
   socket_address:
-    address: 127.0.0.1
+    address: 127.0.0.2
     port_value: {{ .Ports.ServerPort }}
 {{- end }}
 filter_chains:
@@ -23,6 +23,7 @@ filter_chains:
       "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
       codec_type: AUTO
       stat_prefix: server
+{{ .Vars.ServerHTTPAccessLogs | fill | indent 6 }}
       http_filters:
 {{ .Vars.ServerHTTPFilters | fill | indent 6 }}
       - name: envoy.filters.http.router

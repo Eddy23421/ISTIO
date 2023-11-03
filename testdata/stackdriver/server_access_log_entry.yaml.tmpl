@@ -5,7 +5,7 @@ http_request:
   request_method: "GET"
   {{- end }}
   request_url: "http://127.0.0.1:{{ .Ports.ClientPort }}/{{ .Vars.RequestPath }}"
-  server_ip: "127.0.0.1:{{ .Ports.ServerPort }}"
+  server_ip: "127.0.0.2:{{ .Ports.ServerPort }}"
   protocol: "http"
   status: {{ .Vars.SDLogStatusCode }}
   {{- if .Vars.UserAgent }}
@@ -42,6 +42,7 @@ labels:
   upstream_cluster: "server-inbound-cluster"
   {{- if .Vars.RbacAccessDenied }}
   response_details: "AuthzDenied"
+  route_name: server_route
   policy_name: "foo.httpbin-deny"
   policy_rule: "0"
   {{-  else }}

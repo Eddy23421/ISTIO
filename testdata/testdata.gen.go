@@ -1,6 +1,7 @@
 // Code generated for package testdata by go-bindata DO NOT EDIT. (@generated)
 // sources:
 // bootstrap/client.yaml.tmpl
+// bootstrap/otel_stats.yaml.tmpl
 // bootstrap/server.yaml.tmpl
 // bootstrap/stats.yaml.tmpl
 // listener/client.yaml.tmpl
@@ -121,7 +122,7 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: 127.0.0.1
+                address: 127.0.0.2
                 port_value: {{ .Ports.ServerPort }}
           {{- if eq .Vars.EnableEndpointMetadata "true" }}
           metadata:
@@ -136,6 +137,15 @@ bootstrap_extensions:
   typed_config:
     "@type": type.googleapis.com/udpa.type.v1.TypedStruct
     type_url: type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+{{- if eq .Vars.EnableMetadataDiscovery "true" }}
+- name: metadata_discovery
+  typed_config:
+    "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+    type_url: type.googleapis.com/istio.workload.BootstrapExtension
+    value:
+      config_source:
+        ads: {}
+{{- end }}
 `)
 
 func bootstrapClientYamlTmplBytes() ([]byte, error) {
@@ -153,6 +163,35 @@ func bootstrapClientYamlTmpl() (*asset, error) {
 	return a, nil
 }
 
+var _bootstrapOtel_statsYamlTmpl = []byte(`stats_sinks:
+- name: otel
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig
+    grpc_service:
+      envoy_grpc:
+        cluster_name: otel
+stats_config:
+  stats_matcher:
+    inclusion_list:
+      patterns:
+      - prefix: "istiocustom."
+`)
+
+func bootstrapOtel_statsYamlTmplBytes() ([]byte, error) {
+	return _bootstrapOtel_statsYamlTmpl, nil
+}
+
+func bootstrapOtel_statsYamlTmpl() (*asset, error) {
+	bytes, err := bootstrapOtel_statsYamlTmplBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "bootstrap/otel_stats.yaml.tmpl", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
 var _bootstrapServerYamlTmpl = []byte(`node:
   id: server
   cluster: test-cluster
@@ -166,7 +205,11 @@ admin:
 {{ .Vars.StatsConfig }}
 dynamic_resources:
   ads_config:
+{{- if eq .Vars.EnableDelta "true" }}
+    api_type: DELTA_GRPC
+{{- else }}
     api_type: GRPC
+{{- end}}
     transport_api_version: V3
     grpc_services:
     - envoy_grpc:
@@ -213,21 +256,15 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: 127.0.0.1
+                address: 127.0.0.3
                 port_value: {{ .Ports.BackendPort }}
-          {{- if eq .Vars.EnableEndpointMetadata "true" }}
-          metadata:
-            filter_metadata:
-              istio:
-                workload: ratings-v1;default;ratings;version-1;server-cluster
-          {{- end }}
 {{ .Vars.ServerStaticCluster | indent 2 }}
 {{- if ne .Vars.DisableDirectResponse "true" }}
   listeners:
   - name: staticreply
     address:
       socket_address:
-        address: 127.0.0.1
+        address: 127.0.0.3
         port_value: {{ .Ports.BackendPort }}
     filter_chains:
     - filters:
@@ -262,6 +299,15 @@ bootstrap_extensions:
   typed_config:
     "@type": type.googleapis.com/udpa.type.v1.TypedStruct
     type_url: type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+{{- if eq .Vars.EnableMetadataDiscovery "true" }}
+- name: metadata_discovery
+  typed_config:
+    "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+    type_url: type.googleapis.com/istio.workload.BootstrapExtension
+    value:
+      config_source:
+        ads: {}
+{{- end }}
 `)
 
 func bootstrapServerYamlTmplBytes() ([]byte, error) {
@@ -385,6 +431,7 @@ filter_chains:
       "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
       codec_type: AUTO
       stat_prefix: client
+{{ .Vars.ClientHTTPAccessLogs | fill | indent 6 }}
       http_filters:
 {{ .Vars.ClientHTTPFilters | fill | indent 6 }}
       - name: envoy.filters.http.router
@@ -440,7 +487,21 @@ filter_chains:
       - name: connect_authority
         typed_config:
           "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-          type_url: type.googleapis.com/io.istio.http.connect_authority.Config
+          type_url: type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+          value:
+            on_request_headers:
+            - object_key: envoy.filters.listener.original_dst.local_ip
+              format_string:
+                text_format_source:
+                  inline_string: "%REQ(:AUTHORITY)%"
+                omit_empty_values: true
+              shared_with_upstream: ONCE
+              skip_if_empty: true
+            - object_key: envoy.filters.listener.original_dst.remote_ip
+              format_string:
+                text_format_source:
+                  inline_string: "%DOWNSTREAM_REMOTE_ADDRESS%"
+              shared_with_upstream: ONCE
       - name: envoy.filters.http.router
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -452,13 +513,6 @@ filter_chains:
           routes:
           - name: client_route
             match: { prefix: / }
-            typed_per_filter_config:
-              connect_authority:
-                "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-                type_url: type.googleapis.com/io.istio.http.connect_authority.Config
-                value:
-                  enabled: true
-                  port: {{ .Ports.ServerTunnelPort }}
             route:
               cluster: tcp_passthrough
               timeout: 0s
@@ -485,7 +539,7 @@ listener_filters:
 - name: set_dst_address
   typed_config:
     "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-    type_url: type.googleapis.com/istio.set_internal_dst_address.v1.Config
+    type_url: type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst
 filter_chains:
 - filters:
   - name: tcp_proxy
@@ -530,7 +584,7 @@ internal_listener: {}
 {{- else }}
 address:
   socket_address:
-    address: 127.0.0.1
+    address: 127.0.0.2
     port_value: {{ .Ports.ServerPort }}
 {{- end }}
 filter_chains:
@@ -541,6 +595,7 @@ filter_chains:
       "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
       codec_type: AUTO
       stat_prefix: server
+{{ .Vars.ServerHTTPAccessLogs | fill | indent 6 }}
       http_filters:
 {{ .Vars.ServerHTTPFilters | fill | indent 6 }}
       - name: envoy.filters.http.router
@@ -623,13 +678,20 @@ listener_filters:
 - name: set_dst_address
   typed_config:
     "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-    type_url: type.googleapis.com/istio.set_internal_dst_address.v1.Config
+    type_url: type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst
 filter_chains:
 - filters:
   - name: connect_authority
     typed_config:
       "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-      type_url: type.googleapis.com/io.istio.http.connect_authority.Config
+      type_url: type.googleapis.com/envoy.extensions.filters.network.set_filter_state.v3.Config
+      value:
+        on_new_connection:
+        - object_key: envoy.filters.listener.original_dst.local_ip
+          format_string:
+            text_format_source:
+              inline_string: "%FILTER_STATE(envoy.filters.listener.original_dst.local_ip:PLAIN)%"
+          shared_with_upstream: ONCE
   - name: tcp_proxy
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
@@ -656,7 +718,7 @@ var _listenerTcp_serverYamlTmpl = []byte(`name: server
 traffic_direction: INBOUND
 address:
   socket_address:
-    address: 127.0.0.1
+    address: 127.0.0.2
     port_value: {{ .Ports.ServerPort }}
 listener_filters:
 - name: "envoy.filters.listener.tls_inspector"
@@ -699,7 +761,7 @@ address:
 {{ if eq .Vars.quic "true" }}
     protocol: UDP
 {{ end }}
-    address: 127.0.0.1
+    address: 127.0.0.2
     port_value: {{ .Ports.ServerTunnelPort }}
 {{ if eq .Vars.quic "true" }}
 udp_listener_config:
@@ -710,14 +772,6 @@ udp_listener_config:
 filter_chains:
 - filters:
   # Capture SSL info for the internal listener passthrough
-{{ if eq .Vars.quic "true" }}
-# TODO: accessing uriSanPeerCertificates() triggers a crash in quiche version.
-{{ else }}
-  - name: authn
-    typed_config:
-      "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-      type_url: type.googleapis.com/io.istio.network.authn.Config
-{{ end }}
   - name: envoy.filters.network.http_connection_manager
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
@@ -742,10 +796,34 @@ filter_chains:
                 connect_config:
                   {}
       http_filters:
-      - name: connect_baggage
+      {{ if eq .Vars.quic "true" }}
+      # TODO: accessing uriSanPeerCertificates() triggers a crash in quiche version.
+      {{ else }}
+      - name: authn
         typed_config:
           "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-          type_url: type.googleapis.com/io.istio.http.connect_baggage.Config
+          type_url: type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+          value:
+            on_request_headers:
+            - object_key: io.istio.peer_principal
+              format_string:
+                text_format_source:
+                  inline_string: "%DOWNSTREAM_PEER_URI_SAN%"
+              shared_with_upstream: ONCE
+            - object_key: io.istio.local_principal
+              format_string:
+                text_format_source:
+                  inline_string: "%DOWNSTREAM_LOCAL_URI_SAN%"
+              shared_with_upstream: ONCE
+      {{ end }}
+      - name: peer_metadata
+        typed_config:
+          "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+          type_url: type.googleapis.com/io.istio.http.peer_metadata.Config
+          value:
+            downstream_discovery:
+            - baggage: {}
+            shared_with_upstream: true
       - name: envoy.filters.http.router
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -868,6 +946,7 @@ func AssetNames() []string {
 // _bindata is a table, holding each asset generator, mapped to its name.
 var _bindata = map[string]func() (*asset, error){
 	"bootstrap/client.yaml.tmpl":            bootstrapClientYamlTmpl,
+	"bootstrap/otel_stats.yaml.tmpl":        bootstrapOtel_statsYamlTmpl,
 	"bootstrap/server.yaml.tmpl":            bootstrapServerYamlTmpl,
 	"bootstrap/stats.yaml.tmpl":             bootstrapStatsYamlTmpl,
 	"listener/client.yaml.tmpl":             listenerClientYamlTmpl,
@@ -922,9 +1001,10 @@ type bintree struct {
 
 var _bintree = &bintree{nil, map[string]*bintree{
 	"bootstrap": &bintree{nil, map[string]*bintree{
-		"client.yaml.tmpl": &bintree{bootstrapClientYamlTmpl, map[string]*bintree{}},
-		"server.yaml.tmpl": &bintree{bootstrapServerYamlTmpl, map[string]*bintree{}},
-		"stats.yaml.tmpl":  &bintree{bootstrapStatsYamlTmpl, map[string]*bintree{}},
+		"client.yaml.tmpl":     &bintree{bootstrapClientYamlTmpl, map[string]*bintree{}},
+		"otel_stats.yaml.tmpl": &bintree{bootstrapOtel_statsYamlTmpl, map[string]*bintree{}},
+		"server.yaml.tmpl":     &bintree{bootstrapServerYamlTmpl, map[string]*bintree{}},
+		"stats.yaml.tmpl":      &bintree{bootstrapStatsYamlTmpl, map[string]*bintree{}},
 	}},
 	"listener": &bintree{nil, map[string]*bintree{
 		"client.yaml.tmpl":             &bintree{listenerClientYamlTmpl, map[string]*bintree{}},

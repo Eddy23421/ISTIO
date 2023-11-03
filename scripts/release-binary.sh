@@ -19,19 +19,14 @@
 set -ex
 
 # Use clang for the release builds.
-export PATH=/usr/lib/llvm-10/bin:$PATH
-export CC=${CC:-clang}
-export CXX=${CXX:-clang++}
+export PATH=/usr/lib/llvm/bin:$PATH
+export CC=${CC:-/usr/lib/llvm/bin/clang}
+export CXX=${CXX:-/usr/lib/llvm/bin/clang++}
 
 # ARCH_SUFFIX allows optionally appending a -{ARCH} suffix to published binaries.
 # For backwards compatibility, Istio skips this for amd64.
 # Note: user provides "arm64"; we expand to "-arm64" for simple usage in script.
 export ARCH_SUFFIX="${ARCH_SUFFIX+-${ARCH_SUFFIX}}"
-
-# Add --config=libc++ if wasn't passed already.
-if [[ "$(uname)" != "Darwin" && "${BAZEL_BUILD_ARGS}" != *"--config=libc++"* ]]; then
-  BAZEL_BUILD_ARGS="${BAZEL_BUILD_ARGS} --config=libc++"
-fi
 
 # Expliticly stamp.
 BAZEL_BUILD_ARGS="${BAZEL_BUILD_ARGS} --stamp"
@@ -39,13 +34,13 @@ BAZEL_BUILD_ARGS="${BAZEL_BUILD_ARGS} --stamp"
 if [[ "$(uname)" == "Darwin" ]]; then
   BAZEL_CONFIG_ASAN="--config=macos-asan"
 else
-  BAZEL_CONFIG_ASAN="--config=clang-asan"
+  BAZEL_CONFIG_ASAN="--config=clang-asan-ci"
 fi
 
 # The bucket name to store proxy binaries.
 DST=""
 
-# Verify that we're building binaries on Ubuntu 16.04 (Xenial).
+# Verify that we're building binaries on Ubuntu 18.04 (Bionic).
 CHECK=1
 
 # Defines the base binary name for artifacts. For example, this will be "envoy-debug".
@@ -54,29 +49,18 @@ BASE_BINARY_NAME="${BASE_BINARY_NAME:-"envoy"}"
 # If enabled, we will just build the Envoy binary rather than wasm, etc
 BUILD_ENVOY_BINARY_ONLY="${BUILD_ENVOY_BINARY_ONLY:-0}"
 
-# Push envoy docker image.
-PUSH_DOCKER_IMAGE=0
-
-# Support CentOS builds
-BUILD_FOR_CENTOS=0
-
 function usage() {
   echo "$0
     -d  The bucket name to store proxy binary (optional).
         If not provided, both envoy binary push and docker image push are skipped.
-    -i  Skip Ubuntu Xenial check. DO NOT USE THIS FOR RELEASED BINARIES.
-    -c  Build for CentOS releases. This will disable the Ubuntu Xenial check.
-    -p  Push wasm oci image.
-        Registry is hard coded to gcr.io and repository is controlled via DOCKER_REPOSITORY and WASM_REPOSITORY env var."
+    -i  Skip Ubuntu Bionic check. DO NOT USE THIS FOR RELEASED BINARIES."
   exit 1
 }
 
-while getopts d:ipc arg ; do
+while getopts d:i arg ; do
   case "${arg}" in
     d) DST="${OPTARG}";;
     i) CHECK=0;;
-    p) PUSH_DOCKER_IMAGE=1;;
-    c) BUILD_FOR_CENTOS=1;;
     *) usage;;
   esac
 done
@@ -94,16 +78,13 @@ if [ "${DST}" == "none" ]; then
   DST=""
 fi
 
-# Make sure the release binaries are built on x86_64 Ubuntu 16.04 (Xenial)
-if [ "${CHECK}" -eq 1 ] && [ "${BUILD_FOR_CENTOS}" -eq 0 ]; then
+# Make sure the release binaries are built on x86_64 Ubuntu 18.04 (Bionic)
+if [ "${CHECK}" -eq 1 ] ; then
   if [[ "${BAZEL_BUILD_ARGS}" != *"--config=remote-"* ]]; then
     UBUNTU_RELEASE=${UBUNTU_RELEASE:-$(lsb_release -c -s)}
-    [[ "${UBUNTU_RELEASE}" == 'xenial' ]] || { echo 'Must run on Ubuntu 16.04 (Xenial).'; exit 1; }
+    [[ "${UBUNTU_RELEASE}" == 'bionic' ]] || { echo 'Must run on Ubuntu Bionic.'; exit 1; }
   fi
   [[ "$(uname -m)" == 'x86_64' ]] || { echo 'Must run on x86_64.'; exit 1; }
-elif [ "${CHECK}" -eq 1 ] && [ "${BUILD_FOR_CENTOS}" -eq 1 ]; then
-  # Make sure the release binaries are built on CentOS 7
-  [[ $(</etc/centos-release tr -dc '0-9.'|cut -d \. -f1) == "7" ]] || { echo "Must run on CentOS 7, got $(cat /centos-release)"; exit 1; }
 fi
 
 # The proxy binary name.
@@ -143,11 +124,14 @@ do
       BAZEL_OUT="$(bazel info ${BAZEL_BUILD_ARGS} output_path)/${ARCH_NAME}-opt/bin"
       ;;
     "asan")
-      # NOTE: libc++ is dynamically linked in this build.
-      CONFIG_PARAMS="${BAZEL_CONFIG_ASAN} --config=release-symbol"
-      BINARY_BASE_NAME="${BASE_BINARY_NAME}-asan"
-      # shellcheck disable=SC2086
-      BAZEL_OUT="$(bazel info ${BAZEL_BUILD_ARGS} output_path)/${ARCH_NAME}-opt/bin"
+      # Asan is skipped on ARM64
+      if [[ "$(uname -m)" != "aarch64" ]]; then
+        # NOTE: libc++ is dynamically linked in this build.
+        CONFIG_PARAMS="${BAZEL_CONFIG_ASAN} --config=release-symbol"
+        BINARY_BASE_NAME="${BASE_BINARY_NAME}-asan"
+        # shellcheck disable=SC2086
+        BAZEL_OUT="$(bazel info ${BAZEL_BUILD_ARGS} output_path)/${ARCH_NAME}-opt/bin"
+      fi
       ;;
     "debug")
       CONFIG_PARAMS="--config=debug"
@@ -178,47 +162,37 @@ do
   fi
 done
 
+echo "Checking extensions build config"
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="${ROOT}/WORKSPACE"
+
+ENVOY_ORG="$(grep -Pom1 "^ENVOY_ORG = \"\K[a-zA-Z-]+" "${WORKSPACE}")"
+ENVOY_REPO="$(grep -Pom1 "^ENVOY_REPO = \"\K[a-zA-Z-]+" "${WORKSPACE}")"
+ENVOY_SHA="$(grep -Pom1 "^ENVOY_SHA = \"\K[a-zA-Z0-9]{40}" "${WORKSPACE}")"
+
+TMP_DIR=$(mktemp -d)
+ENVOY_EXTENSIONS_BUILD_CONFIG="${TMP_DIR}/envoy.bzl"
+PROXY_EXTENSIONS_BUILD_CONFIG="${TMP_DIR}/proxy.bzl"
+
+echo "get envoy extensions build config from ${ENVOY_ORG}/${ENVOY_REPO} commit: ${ENVOY_SHA}"
+curl --silent --show-error --retry 10 --location \
+      "https://raw.githubusercontent.com/${ENVOY_ORG}/${ENVOY_REPO}/${ENVOY_SHA}/source/extensions/extensions_build_config.bzl" \
+      -o "${ENVOY_EXTENSIONS_BUILD_CONFIG}" \
+    || { echo "Could not get envoy extensions build config." ; exit 1 ; }
+
+# backup proxy extension build config
+cp "${ROOT}/bazel/extension_config/extensions_build_config.bzl" "${TMP_DIR}/proxy.bzl"
+# remove the first line
+sed -i "1d" "${PROXY_EXTENSIONS_BUILD_CONFIG}"
+
+go run tools/extension-check/main.go \
+  --ignore-extensions tools/extension-check/wellknown-extensions \
+  --envoy-extensions-build-config "${ENVOY_EXTENSIONS_BUILD_CONFIG}" \
+  --proxy-extensions-build-config "${PROXY_EXTENSIONS_BUILD_CONFIG}" \
+  || { echo "failed to check extension build config"; exit 1;}
+
 # Exit early to skip wasm build
 if [ "${BUILD_ENVOY_BINARY_ONLY}" -eq 1 ]; then
   exit 0
-fi
-
-# Build and publish Wasm plugins
-extensions=(stats metadata_exchange attributegen)
-TMP_WASM=$(mktemp -d -t wasm-plugins-XXXXXXXXXX)
-trap 'rm -rf ${TMP_WASM}' EXIT
-make build_wasm
-if [ -n "${DST}" ]; then
-  for extension in "${extensions[@]}"; do
-    if [ "${PUSH_DOCKER_IMAGE}" -eq 1 ]; then
-      echo "Pushing Wasm OCI image for ${extension}"
-      # shellcheck disable=SC2086
-      bazel run ${BAZEL_BUILD_ARGS} ${CONFIG_PARAMS} //extensions:push_wasm_image_${extension}
-    fi
-    # Rename the plugin file and generate sha256 for it
-    WASM_NAME="${extension}-${SHA}.wasm"
-    WASM_COMPILED_NAME="${extension}-${SHA}.compiled.wasm"
-    WASM_PATH="${TMP_WASM}/${WASM_NAME}"
-    WASM_COMPILED_PATH="${TMP_WASM}/${WASM_COMPILED_NAME}"
-    SHA256_PATH="${WASM_PATH}.sha256"
-    SHA256_COMPILED_PATH="${WASM_COMPILED_PATH}.sha256"
-    # shellcheck disable=SC2086
-    BAZEL_TARGET=$(bazel info ${BAZEL_BUILD_ARGS} output_path)/${ARCH_NAME}-opt/bin/extensions/${extension}.wasm
-    # shellcheck disable=SC2086
-    BAZEL_COMPILED_TARGET=$(bazel info ${BAZEL_BUILD_ARGS} output_path)/${ARCH_NAME}-opt/bin/extensions/${extension}.compiled.wasm
-    cp "${BAZEL_TARGET}" "${WASM_PATH}"
-    cp "${BAZEL_COMPILED_TARGET}" "${WASM_COMPILED_PATH}"
-    sha256sum "${WASM_PATH}" > "${SHA256_PATH}"
-    sha256sum "${WASM_COMPILED_PATH}" > "${SHA256_COMPILED_PATH}"
-
-    # push wasm files and sha to the given bucket
-    gsutil stat "${DST}/${WASM_NAME}" \
-      && { echo "WASM file ${WASM_NAME} already exist"; continue; } \
-      || echo "Pushing the WASM file ${WASM_NAME}"
-    gsutil stat "${DST}/${WASM_COMPILED_NAME}" \
-      && { echo "WASM file ${WASM_COMPILED_NAME} already exist"; continue; } \
-      || echo "Pushing the WASM file ${WASM_COMPILED_NAME}"
-    gsutil cp "${WASM_PATH}" "${SHA256_PATH}" "${DST}"
-    gsutil cp "${WASM_COMPILED_PATH}" "${SHA256_COMPILED_PATH}" "${DST}"
-  done
 fi

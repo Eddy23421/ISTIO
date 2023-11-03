@@ -165,6 +165,7 @@ func TestBasicCONNECT(t *testing.T) {
 			params.Vars["ServerInternalAddress"] = "internal_inbound"
 			params.Vars["quic"] = strconv.FormatBool(options.Quic)
 			params.Vars["EnableTunnelEndpointMetadata"] = "true"
+			params.Vars["EnableOriginalDstPortOverride"] = "true"
 
 			updateClient := &driver.Update{
 				Node: "client", Version: "{{ .N }}",
@@ -215,6 +216,7 @@ func TestPassthroughCONNECT(t *testing.T) {
 			params.Vars["ServerClusterName"] = "internal_outbound"
 			params.Vars["ServerInternalAddress"] = "internal_inbound"
 			params.Vars["quic"] = strconv.FormatBool(options.Quic)
+			params.Vars["EnableOriginalDstPortOverride"] = "true"
 
 			updateClient := &driver.Update{
 				Node: "client", Version: "{{ .N }}",
@@ -234,7 +236,7 @@ func TestPassthroughCONNECT(t *testing.T) {
 			}
 
 			req := driver.Get(params.Ports.ClientPort, "hello, world!")
-			req.Authority = fmt.Sprintf("127.0.0.1:%d", params.Ports.ServerPort)
+			req.Authority = fmt.Sprintf("127.0.0.2:%d", params.Ports.ServerPort)
 
 			if err := (&driver.Scenario{
 				Steps: []driver.Step{

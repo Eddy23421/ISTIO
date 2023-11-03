@@ -52,8 +52,21 @@ envoy_cc_library(
     repository = "@envoy",
     visibility = ["//visibility:public"],
     deps = [
-        "//extensions/common:json_util",
         "@envoy//source/exe:envoy_common_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "filter_objects_lib",
+    hdrs = [
+        "filter_objects.h",
+    ],
+    repository = "@envoy",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@envoy//envoy/registry",
+        "@envoy//envoy/stream_info:filter_state_interface",
+        "@envoy//source/common/router:string_accessor_lib",
     ],
 )
 

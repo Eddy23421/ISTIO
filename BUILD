@@ -36,21 +36,13 @@ envoy_cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//extensions/access_log_policy:access_log_policy_lib",
-        "//extensions/attributegen:attributegen_plugin",
-        "//extensions/metadata_exchange:metadata_exchange_lib",
         "//extensions/stackdriver:stackdriver_plugin",
-        "//extensions/stats:stats_plugin",
+        "//source/extensions/common/workload_discovery:api_lib",  # Experimental: WIP
         "//source/extensions/filters/http/alpn:config_lib",
         "//source/extensions/filters/http/authn:filter_lib",
-        "//source/extensions/filters/http/connect_authority",  # Experimental: ambient
-        "//source/extensions/filters/http/connect_baggage",  # Experimental: ambient
         "//source/extensions/filters/http/istio_stats",
-        "//source/extensions/filters/listener/set_internal_dst_address:filter_lib",  # Experimental: ambient
-        "//source/extensions/filters/network/forward_downstream_sni:config_lib",
-        "//source/extensions/filters/network/istio_authn:config_lib",
+        "//source/extensions/filters/http/peer_metadata:filter_lib",
         "//source/extensions/filters/network/metadata_exchange:config_lib",
-        "//source/extensions/filters/network/sni_verifier:config_lib",
-        "//source/extensions/filters/network/tcp_cluster_rewrite:config_lib",
         "@envoy//source/exe:envoy_main_entry_lib",
     ],
 )

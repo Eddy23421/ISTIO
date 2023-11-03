@@ -144,6 +144,7 @@ envoy_extension_cc_benchmark_binary(
         ":proto_util",
         "@envoy//source/common/stream_info:filter_state_lib",
         "@envoy//source/extensions/filters/common/expr:cel_state_lib",
+        "@envoy//test/test_common:status_utility_lib",
     ],
 )
 
@@ -177,10 +178,14 @@ envoy_cc_library(
     ],
     hdrs = [
         "//extensions/common/wasm:json_util.h",
-        "//extensions/common/wasm:nlohmann_json_hpp",
     ],
     repository = "@envoy",
     visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_nlohmann_json//:json",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:optional",
+    ],
 )
 
 envoy_cc_library(
